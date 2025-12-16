@@ -37,13 +37,14 @@ jobs:
         run: |
           set -e
           curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=1&per_page=100" > gitee_releases.json
-          exists=$(python3 - <<'PY'
+
+          exists=$(python3 - "$TAG" <<'PY'
           import json, sys
-          tag=sys.argv[1]
-          arr=json.load(open("gitee_releases.json","r",encoding="utf-8"))
+          tag = sys.argv[1]
+          arr = json.load(open("gitee_releases.json","r",encoding="utf-8"))
           print("1" if any(r.get("tag_name")==tag for r in arr) else "0")
           PY
-          "${TAG}")
+          )
           echo "exists=$exists" >> $GITHUB_OUTPUT
 
       - name: Done (already synced)
