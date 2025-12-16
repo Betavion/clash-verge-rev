@@ -120,10 +120,18 @@ jobs:
           RELEASE_ID:  ${{ steps.create.outputs.release_id }}
         run: |
           set -e
+          shopt -s nullglob
+
           for f in assets/*; do
             echo "Uploading $f"
-            curl -sS -X POST \
-              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+            curl \
+              --progress-bar \
+              --connect-timeout 20 \
+              --max-time 900 \
+              --retry 3 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${f}" >/dev/null
+              -F "file=@${f}" || echo "WARN: upload failed: $f"
           done
