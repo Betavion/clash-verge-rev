@@ -128,38 +128,32 @@ jobs:
             bn=$(basename "$f")
             echo "Uploading $bn"
 
-          resp=$(curl \
-            --progress-bar \
-            --connect-timeout 20 \
-            --max-time 1200 \
-            --retry 3 \
-            --retry-delay 5 \
-            --retry-all-errors \
-            -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-            -F "access_token=${GITEE_TOKEN}" \
-            -F "file=@${f}" )
+            resp=$(curl \
+              --progress-bar \
+              --connect-timeout 20 \
+              --retry 3 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${f}" )
 
-          # 从返回 JSON 提取 Gitee 下载链接
-          url=$(python3 - <<'PY'
-          import json,sys
-          d=json.loads(sys.stdin.read())
-          print(d.get("browser_download_url",""))
-          PY
-          <<< "$resp")
-          
-          if [ -z "$url" ]; then
-            echo "WARN: upload failed(no url): $bn"
-            continue
-          fi
+            # 提取 Gitee 下载链接
+            url=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("browser_download_url",""))' <<< "$resp")
 
-          # 写入映射：{ "filename": "gitee_url", ... }
-          python3 - <<'PY'
-          import json,sys
-          fn=sys.argv[1]; url=sys.argv[2]
-          m=json.load(open("assets_map.json","r",encoding="utf-8"))
-          m[fn]=url
-          json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-          PY "$bn" "$url"
+            if [ -z "$url" ]; then
+              echo "WARN: upload failed(no url): $bn"
+              continue
+            fi
+
+            # 写入映射：{ "filename": "gitee_url", ... }
+            python3 -c '
+            import json,sys
+            fn=sys.argv[1]; url=sys.argv[2]
+            m=json.load(open("assets_map.json","r",encoding="utf-8"))
+            m[fn]=url
+            json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+            ' "$bn" "$url"
           done
 
           echo "assets_map.json:"
