@@ -163,56 +163,35 @@ jobs:
         run: |
           set -e
 
-          # 读取原 body + 映射，生成新 body
-          python3 - <<'PY'
-          import json,re
+          # 从 GitHub release API 的 latest.json 里取 tag/name/body/prerelease
+          python3 -c 'import json; d=json.load(open("latest.json","r",encoding="utf-8")); \
+          open("meta.json","w",encoding="utf-8").write(json.dumps({ \
+            "tag_name": d["tag_name"], \
+            "name": (d.get("name") or d["tag_name"]), \
+            "body": (d.get("body") or ""), \
+            "prerelease": bool(d.get("prerelease")) \
+          }, ensure_ascii=False))'
 
-          latest=json.load(open("latest.json","r",encoding="utf-8"))
-          body=latest.get("body") or ""
-          m=json.load(open("assets_map.json","r",encoding="utf-8"))
-
-          # 仅替换 GitHub release download 链接里出现的文件名
-          def repl(match):
-              fn = match.group(1)
-              return m.get(fn, match.group(0))
-
-          pattern = r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)]+)"
-          new_body = re.sub(pattern, repl, body)
-
-          open("new_body.txt","w",encoding="utf-8").write(new_body)
-          PY
-
-          echo "PATCH release body to Gitee..."
-          curl -sS -X PATCH \
-            "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
-            -F "access_token=${GITEE_TOKEN}" \
-            -F "body=@new_body.txt" >/dev/null
-
-      - name: Rewrite release body links to Gitee and update
-        if: ${{ steps.check.outputs.exists != '1' }}
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
-          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
-          RELEASE_ID:  ${{ steps.create.outputs.release_id }}
-        run: |
-          set -e
-
-          # 生成 new_body.txt：用 assets_map.json 把 body 里 GitHub 下载链接替换成 Gitee 链接
-          python3 -c 'import json,re; \
-          latest=json.load(open("latest.json","r",encoding="utf-8")); \
-          body=latest.get("body") or ""; \
-          m=json.load(open("assets_map.json","r",encoding="utf-8")); \
+          # 用 assets_map.json 替换 body 里的 GitHub 下载链接 -> Gitee
+          python3 -c 'import json,re; meta=json.load(open("meta.json","r",encoding="utf-8")); \
+          m=json.load(open("assets_map.json","r",encoding="utf-8")); body=meta["body"]; \
           pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)"); \
           new_body=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body); \
-          open("new_body.txt","w",encoding="utf-8").write(new_body); \
+          meta["body"]=new_body; \
+          open("meta_rewritten.json","w",encoding="utf-8").write(json.dumps(meta, ensure_ascii=False)); \
           print("Matched:", len(pat.findall(body))); \
           print("Replaced:", sum(1 for fn in pat.findall(body) if fn in m))'
 
-          # 用 JSON PATCH 更新 release body（更稳）
-          python3 -c 'import json; \
-          body=open("new_body.txt","r",encoding="utf-8").read(); \
-          open("patch.json","w",encoding="utf-8").write(json.dumps({"access_token":"'"${GITEE_TOKEN}"'","body":body}, ensure_ascii=False))'
+          # 生成 Gitee PATCH JSON：必须带 tag_name 和 name
+          python3 -c 'import json; meta=json.load(open("meta_rewritten.json","r",encoding="utf-8")); \
+          patch={ \
+            "access_token":"'"${GITEE_TOKEN}"'", \
+            "tag_name": meta["tag_name"], \
+            "name": meta["name"], \
+            "body": meta["body"], \
+            "prerelease": meta["prerelease"] \
+          }; \
+          open("patch.json","w",encoding="utf-8").write(json.dumps(patch, ensure_ascii=False))'
 
           echo "PATCH release body to Gitee..."
           resp=$(curl -sS -X PATCH \
