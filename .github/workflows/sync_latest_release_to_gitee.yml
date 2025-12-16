@@ -1,0 +1,117 @@
+name: Sync upstream latest Release to Gitee
+
+on:
+  schedule:
+    - cron: "20 3 * * *"  # 每天 UTC 03:20 跑一次
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch upstream latest release
+        id: upstream
+        run: |
+          set -e
+          UPSTREAM="clash-verge-rev/clash-verge-rev"
+          curl -sS "https://api.github.com/repos/${UPSTREAM}/releases/latest" > latest.json
+
+          tag=$(python3 - <<'PY'
+import json
+d=json.load(open("latest.json","r",encoding="utf-8"))
+print(d.get("tag_name",""))
+PY
+)
+          if [ -z "$tag" ]; then
+            echo "No latest release found"; cat latest.json; exit 1
+          fi
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+
+      - name: Check if Gitee already has this tag release
+        id: check
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          TAG:         ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -e
+          curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=1&per_page=100" > gitee_releases.json
+          exists=$(python3 - <<'PY'
+import json, sys
+tag=sys.argv[1]
+arr=json.load(open("gitee_releases.json","r",encoding="utf-8"))
+print("1" if any(r.get("tag_name")==tag for r in arr) else "0")
+PY
+"${TAG}")
+          echo "exists=$exists" >> $GITHUB_OUTPUT
+
+      - name: Done (already synced)
+        if: ${{ steps.check.outputs.exists == '1' }}
+        run: echo "Already synced tag ${{ steps.upstream.outputs.tag }}"
+
+      - name: Create release on Gitee
+        if: ${{ steps.check.outputs.exists != '1' }}
+        id: create
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+        run: |
+          set -e
+          tag=$(python3 -c "import json;print(json.load(open('latest.json'))['tag_name'])")
+          name=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('name') or d['tag_name'])")
+          body=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('body') or '')")
+          prerelease=$(python3 -c "import json;d=json.load(open('latest.json'));print('true' if d.get('prerelease') else 'false')")
+
+          resp=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
+            -F "access_token=${GITEE_TOKEN}" \
+            -F "tag_name=${tag}" \
+            -F "name=${name}" \
+            -F "body=${body}" \
+            -F "prerelease=${prerelease}")
+
+          echo "$resp" > gitee_created.json
+          rid=$(python3 - <<'PY'
+import json
+d=json.load(open("gitee_created.json","r",encoding="utf-8"))
+print(d.get("id",""))
+PY
+)
+          if [ -z "$rid" ]; then
+            echo "Create release failed:"; cat gitee_created.json; exit 1
+          fi
+          echo "release_id=$rid" >> $GITHUB_OUTPUT
+
+      - name: Download upstream assets
+        if: ${{ steps.check.outputs.exists != '1' }}
+        run: |
+          set -e
+          mkdir -p assets
+          python3 - <<'PY'
+import json, urllib.request, pathlib
+d=json.load(open("latest.json","r",encoding="utf-8"))
+for a in d.get("assets", []):
+    url=a["browser_download_url"]
+    name=a["name"]
+    out=pathlib.Path("assets")/name
+    print("Downloading", name)
+    urllib.request.urlretrieve(url, out)
+PY
+
+      - name: Upload assets to Gitee release
+        if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.create.outputs.release_id }}
+        run: |
+          set -e
+          for f in assets/*; do
+            echo "Uploading $f"
+            curl -sS -X POST \
+              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${f}" >/dev/null
+          done
