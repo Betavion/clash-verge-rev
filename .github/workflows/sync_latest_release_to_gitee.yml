@@ -17,11 +17,11 @@ jobs:
           curl -sS "https://api.github.com/repos/${UPSTREAM}/releases/latest" > latest.json
 
           tag=$(python3 - <<'PY'
-import json
-d=json.load(open("latest.json","r",encoding="utf-8"))
-print(d.get("tag_name",""))
-PY
-)
+          import json
+          d=json.load(open("latest.json","r",encoding="utf-8"))
+          print(d.get("tag_name",""))
+          PY
+          )
           if [ -z "$tag" ]; then
             echo "No latest release found"; cat latest.json; exit 1
           fi
