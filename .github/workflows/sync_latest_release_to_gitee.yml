@@ -60,14 +60,23 @@ jobs:
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
         run: |
           set -e
+
+          # 取上游 latest release 信息
           tag=$(python3 -c "import json;print(json.load(open('latest.json'))['tag_name'])")
           name=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('name') or d['tag_name'])")
           body=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('body') or '')")
           prerelease=$(python3 -c "import json;d=json.load(open('latest.json'));print('true' if d.get('prerelease') else 'false')")
 
+          # 读取 Gitee 仓库默认分支（避免 main/master 不一致）
+          curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}?access_token=${GITEE_TOKEN}" > repo.json
+          default_branch=$(python3 -c "import json;print(json.load(open('repo.json')).get('default_branch','master'))")
+          echo "Gitee default_branch=${default_branch}"
+
+          # 创建 release（关键：传 target_commitish）
           resp=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
             -F "access_token=${GITEE_TOKEN}" \
             -F "tag_name=${tag}" \
+            -F "target_commitish=${default_branch}" \
             -F "name=${name}" \
             -F "body=${body}" \
             -F "prerelease=${prerelease}")
@@ -79,10 +88,12 @@ jobs:
           print(d.get("id",""))
           PY
           )
-          if [ -z "$rid" ]; then
-            echo "Create release failed:"; cat gitee_created.json; exit 1
-          fi
-          echo "release_id=$rid" >> $GITHUB_OUTPUT
+              if [ -z "$rid" ]; then
+                echo "Create release failed:"
+                cat gitee_created.json
+                exit 1
+              fi
+              echo "release_id=$rid" >> $GITHUB_OUTPUT
 
       - name: Download upstream assets
         if: ${{ steps.check.outputs.exists != '1' }}
