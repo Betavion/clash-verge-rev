@@ -122,15 +122,80 @@ jobs:
           set -e
           shopt -s nullglob
 
+          echo "{}" > assets_map.json
+
           for f in assets/*; do
-            echo "Uploading $f"
-            curl \
+            bn=$(basename "$f")
+            echo "Uploading $bn"
+
+            resp=$(curl \
               --progress-bar \
               --connect-timeout 20 \
+              --max-time 1200 \
               --retry 3 \
               --retry-delay 5 \
               --retry-all-errors \
               -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${f}" || echo "WARN: upload failed: $f"
-          done
+              -F "file=@${f}" )
+
+            # 从返回 JSON 提取 Gitee 下载链接
+            url=$(python3 - <<'PY'
+            import json,sys
+            d=json.loads(sys.stdin.read())
+            print(d.get("browser_download_url",""))
+            PY
+            <<< "$resp")
+            
+                        if [ -z "$url" ]; then
+                          echo "WARN: upload failed(no url): $bn"
+                          continue
+                        fi
+            
+                        # 写入映射：{ "filename": "gitee_url", ... }
+                        python3 - <<'PY'
+            import json,sys
+            fn=sys.argv[1]; url=sys.argv[2]
+            m=json.load(open("assets_map.json","r",encoding="utf-8"))
+            m[fn]=url
+            json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+            PY "$bn" "$url"
+                      done
+
+          echo "assets_map.json:"
+          cat assets_map.json
+
+      - name: Rewrite release body links to Gitee and update
+        if: ${{ steps.check.outputs.exists != '1' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.create.outputs.release_id }}
+        run: |
+          set -e
+
+          # 读取原 body + 映射，生成新 body
+          python3 - <<'PY'
+          import json,re
+
+          latest=json.load(open("latest.json","r",encoding="utf-8"))
+          body=latest.get("body") or ""
+          m=json.load(open("assets_map.json","r",encoding="utf-8"))
+
+          # 仅替换 GitHub release download 链接里出现的文件名
+          def repl(match):
+              fn = match.group(1)
+              return m.get(fn, match.group(0))
+
+          pattern = r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)]+)"
+          new_body = re.sub(pattern, repl, body)
+
+          open("new_body.txt","w",encoding="utf-8").write(new_body)
+          PY
+
+          echo "PATCH release body to Gitee..."
+          curl -sS -X PATCH \
+            "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
+            -F "access_token=${GITEE_TOKEN}" \
+            -F "body=@new_body.txt" >/dev/null
