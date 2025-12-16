@@ -38,12 +38,12 @@ jobs:
           set -e
           curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=1&per_page=100" > gitee_releases.json
           exists=$(python3 - <<'PY'
-import json, sys
-tag=sys.argv[1]
-arr=json.load(open("gitee_releases.json","r",encoding="utf-8"))
-print("1" if any(r.get("tag_name")==tag for r in arr) else "0")
-PY
-"${TAG}")
+          import json, sys
+          tag=sys.argv[1]
+          arr=json.load(open("gitee_releases.json","r",encoding="utf-8"))
+          print("1" if any(r.get("tag_name")==tag for r in arr) else "0")
+          PY
+          "${TAG}")
           echo "exists=$exists" >> $GITHUB_OUTPUT
 
       - name: Done (already synced)
@@ -73,11 +73,11 @@ PY
 
           echo "$resp" > gitee_created.json
           rid=$(python3 - <<'PY'
-import json
-d=json.load(open("gitee_created.json","r",encoding="utf-8"))
-print(d.get("id",""))
-PY
-)
+          import json
+          d=json.load(open("gitee_created.json","r",encoding="utf-8"))
+          print(d.get("id",""))
+          PY
+          )
           if [ -z "$rid" ]; then
             echo "Create release failed:"; cat gitee_created.json; exit 1
           fi
@@ -89,15 +89,15 @@ PY
           set -e
           mkdir -p assets
           python3 - <<'PY'
-import json, urllib.request, pathlib
-d=json.load(open("latest.json","r",encoding="utf-8"))
-for a in d.get("assets", []):
-    url=a["browser_download_url"]
-    name=a["name"]
-    out=pathlib.Path("assets")/name
-    print("Downloading", name)
-    urllib.request.urlretrieve(url, out)
-PY
+          import json, urllib.request, pathlib
+          d=json.load(open("latest.json","r",encoding="utf-8"))
+          for a in d.get("assets", []):
+              url=a["browser_download_url"]
+              name=a["name"]
+              out=pathlib.Path("assets")/name
+              print("Downloading", name)
+              urllib.request.urlretrieve(url, out)
+          PY
 
       - name: Upload assets to Gitee release
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
