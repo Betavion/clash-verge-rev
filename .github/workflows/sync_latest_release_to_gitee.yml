@@ -187,3 +187,31 @@ jobs:
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
             -F "access_token=${GITEE_TOKEN}" \
             -F "body=@new_body.txt" >/dev/null
+
+      - name: Rewrite release body links to Gitee and update
+        if: ${{ steps.check.outputs.exists != '1' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.create.outputs.release_id }}
+        run: |
+          set -e
+
+          python3 -c 'import json,re; \
+          latest=json.load(open("latest.json","r",encoding="utf-8")); \
+          body=latest.get("body") or ""; \
+          m=json.load(open("assets_map.json","r",encoding="utf-8")); \
+          pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)"); \
+          def repl(mm): \
+              fn=mm.group(1); \
+              return m.get(fn, mm.group(0)); \
+          new_body=pat.sub(repl, body); \
+          open("new_body.txt","w",encoding="utf-8").write(new_body); \
+          print("Replaced links:", sum(1 for _ in pat.finditer(body)), "->", sum(1 for _ in pat.finditer(new_body)))'
+
+          echo "PATCH release body to Gitee..."
+          curl -sS -X PATCH \
+            "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
+            -F "access_token=${GITEE_TOKEN}" \
+            -F "body=@new_body.txt" >/dev/null
