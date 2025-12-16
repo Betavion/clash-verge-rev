@@ -198,6 +198,7 @@ jobs:
         run: |
           set -e
 
+          # 生成 new_body.txt：用 assets_map.json 把 body 里 GitHub 下载链接替换成 Gitee 链接
           python3 -c 'import json,re; \
           latest=json.load(open("latest.json","r",encoding="utf-8")); \
           body=latest.get("body") or ""; \
@@ -208,9 +209,17 @@ jobs:
           print("Matched:", len(pat.findall(body))); \
           print("Replaced:", sum(1 for fn in pat.findall(body) if fn in m))'
 
+          # 用 JSON PATCH 更新 release body（更稳）
+          python3 -c 'import json; \
+          body=open("new_body.txt","r",encoding="utf-8").read(); \
+          open("patch.json","w",encoding="utf-8").write(json.dumps({"access_token":"'"${GITEE_TOKEN}"'","body":body}, ensure_ascii=False))'
+
           echo "PATCH release body to Gitee..."
-          curl -sS -X PATCH \
+          resp=$(curl -sS -X PATCH \
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
-            -F "access_token=${GITEE_TOKEN}" \
-            -F "body=@new_body.txt" >/dev/null
+            -H "Content-Type: application/json" \
+            --data-binary @patch.json)
+
+          echo "PATCH response:"
+          echo "$resp"
 
