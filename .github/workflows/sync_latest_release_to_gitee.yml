@@ -147,20 +147,7 @@ jobs:
             fi
 
             # 写入映射：{ "filename": "gitee_url", ... }
-            python3 - "$bn" "$url" <<'PY'
-            import json, sys
-            
-            fn = sys.argv[1]
-            url = sys.argv[2]
-            
-            with open("assets_map.json", "r", encoding="utf-8") as f:
-                m = json.load(f)
-            
-            m[fn] = url
-            
-            with open("assets_map.json", "w", encoding="utf-8") as f:
-                json.dump(m, f, ensure_ascii=False, indent=2)
-            PY
+            python3 -c 'import json,sys; fn=sys.argv[1]; url=sys.argv[2]; m=json.load(open("assets_map.json","r",encoding="utf-8")); m[fn]=url; json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)' "$bn" "$url"
           done
 
           echo "assets_map.json:"
