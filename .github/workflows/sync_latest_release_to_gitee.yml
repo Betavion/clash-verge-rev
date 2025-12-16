@@ -203,15 +203,14 @@ jobs:
           body=latest.get("body") or ""; \
           m=json.load(open("assets_map.json","r",encoding="utf-8")); \
           pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)"); \
-          def repl(mm): \
-              fn=mm.group(1); \
-              return m.get(fn, mm.group(0)); \
-          new_body=pat.sub(repl, body); \
+          new_body=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body); \
           open("new_body.txt","w",encoding="utf-8").write(new_body); \
-          print("Replaced links:", sum(1 for _ in pat.finditer(body)), "->", sum(1 for _ in pat.finditer(new_body)))'
+          print("Matched:", len(pat.findall(body))); \
+          print("Replaced:", sum(1 for fn in pat.findall(body) if fn in m))'
 
           echo "PATCH release body to Gitee..."
           curl -sS -X PATCH \
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
             -F "access_token=${GITEE_TOKEN}" \
             -F "body=@new_body.txt" >/dev/null
+
