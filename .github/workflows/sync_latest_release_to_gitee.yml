@@ -108,7 +108,7 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload assets to Gitee release (curl progress every 5%)
+      - name: Upload assets to Gitee release (real upload progress every 5%, print body on 400, no retry on 400)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -120,6 +120,7 @@ jobs:
           shopt -s nullglob
 
           echo "{}" > assets_map.json
+          : > failed_uploads.txt
 
           for f in assets/*; do
             bn=$(basename "$f")
@@ -129,43 +130,53 @@ jobs:
             success=0
             for attempt in 1 2 3 4 5; do
               tmp_body="$(mktemp)"
+              tmp_hdr="$(mktemp)"
               echo "  attempt ${attempt}/5"
 
-              # 用 curl 自己的进度（真实网络上传），awk 每 5% 打一行，并 fflush 立刻输出
+              # 关键点：
+              # - 使用 curl 自己的 progress meter（是真实网络上传进度）
+              # - progress meter 用 \r 刷新，同一行不换行；用 awk 的 RS='\r' 把每次刷新当成一条记录
+              # - 每 5% 打一行，并 fflush 立即输出
+              # - 禁用 Expect: 100-continue + 强制 http/1.1，减少“0% 直接 400”的情况
               set +e
               http_code=$(
-                curl --fail-with-body \
+                curl --fail-with-body --http1.1 -H "Expect:" \
                   --connect-timeout 20 \
-                  --retry 6 --retry-delay 5 --retry-all-errors \
+                  -D "$tmp_hdr" \
                   -o "$tmp_body" -w "%{http_code}" \
                   -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
                   -F "access_token=${GITEE_TOKEN}" \
                   -F "release_id=${RELEASE_ID}" \
                   -F "file=@${f};filename=${bn};type=application/octet-stream" \
                   2> >(
-                    awk -v fn="$bn" '
+                    awk -v RS='\r' -v fn="$bn" '
                       BEGIN{last=-1}
                       {
-                        gsub(/\r/,"");
-                        # 跳过 header
-                        if ($0 ~ /% Total/) next;
+                        gsub(/\n/,"",$0);
+                        sub(/^[[:space:]]+/,"",$0);
 
-                        # 进度行：第一列是 %Total（整数）
-                        if ($1 ~ /^[0-9]+$/) {
-                          p=$1+0;
+                        # 跳过标题行
+                        if ($0 ~ /^% Total/) next;
+
+                        # 典型 progress 行：第一列是整数百分比
+                        split($0,a,/[[:space:]]+/);
+                        if (a[1] ~ /^[0-9]+$/) {
+                          p=a[1]+0;
                           if (p%5==0 && p!=last) {
-                            printf("  %s %d%%\n", fn, p) > "/dev/stderr";
-                            fflush("/dev/stderr");
+                            printf("  %s %d%%\n", fn, p);
+                            fflush();
                             last=p;
                           }
                           next;
                         }
 
-                        # 非进度信息（少量）原样透传
-                        print > "/dev/stderr";
-                        fflush("/dev/stderr");
+                        # 透传关键错误信息（少量）
+                        if ($0 ~ /^curl: \(/ || $0 ~ /^Warning:/) {
+                          print;
+                          fflush();
+                        }
                       }
-                    '
+                    ' >&2
                   )
               )
               rc=$?
@@ -173,12 +184,24 @@ jobs:
 
               if [ $rc -ne 0 ]; then
                 echo "ERROR: upload failed: $bn (http=${http_code:-unknown})"
+                echo "----- response headers (first 20 lines) -----"
+                head -n 20 "$tmp_hdr" || true
                 echo "----- response body -----"
                 cat "$tmp_body" || true
                 echo "-------------------------"
-                rm -f "$tmp_body"
-                sleep 3
-                continue
+
+                rm -f "$tmp_body" "$tmp_hdr"
+
+                # 只对可能瞬时恢复的情况重试：429 / 5xx / 000(网络)
+                if [ "${http_code:-000}" = "429" ] || [ "${http_code:-000}" = "000" ] || \
+                   [ "${http_code:-000}" = "500" ] || [ "${http_code:-000}" = "502" ] || \
+                   [ "${http_code:-000}" = "503" ] || [ "${http_code:-000}" = "504" ]; then
+                  sleep 5
+                  continue
+                fi
+
+                # 400/401/403/404/422 等：一般重试无意义（但已打印 body 便于你后续定位修复）
+                break
               fi
 
               url=$(python3 - "$tmp_body" <<'PY'
@@ -194,7 +217,7 @@ jobs:
           print(pick(d))
           PY
               )
-              rm -f "$tmp_body"
+              rm -f "$tmp_body" "$tmp_hdr"
 
               if [ -z "$url" ]; then
                 echo "ERROR: upload ok but no url returned: $bn (http=$http_code)"
@@ -216,15 +239,21 @@ jobs:
             done
 
             if [ "$success" -ne 1 ]; then
-              echo "WARN: giving up on $bn after 5 attempts"
+              echo "WARN: giving up on $bn"
+              echo "$bn" >> failed_uploads.txt
             fi
 
-            # 文件间节流，减少触发限流
+            # 文件间节流，减少限流触发
             sleep 1
           done
 
           echo "assets_map.json (from upload responses):"
           cat assets_map.json
+
+          if [ -s failed_uploads.txt ]; then
+            echo "WARN: Some assets failed to upload (listed below). Workflow will continue."
+            cat failed_uploads.txt
+          fi
 
       - name: Refresh assets_map.json by listing Gitee attachments (most reliable)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
