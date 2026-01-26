@@ -123,28 +123,31 @@ jobs:
 
           for f in assets/*; do
             bn=$(basename "$f")
-            echo "Uploading $bn"
+            sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            echo "Uploading $bn (size=${sz} bytes)"
 
             tmp_body="$(mktemp)"
-            # 关键：fail-with-body + 捕获 http_code，使 4xx/5xx 可见，并能触发 retry
+
+            # 关键修复点：
+            # 1) multipart 里带 release_id（很多示例都这么做，即便 URL 里已有）:contentReference[oaicite:2]{index=2}
+            # 2) 强制 MIME 为 application/octet-stream，避免 rpm/exe 自动 MIME 触发服务端校验
             if ! http_code=$(curl -sS --fail-with-body \
                 --connect-timeout 20 \
                 --retry 6 --retry-delay 5 --retry-all-errors \
                 -o "$tmp_body" -w "%{http_code}" \
                 -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
                 -F "access_token=${GITEE_TOKEN}" \
-                -F "file=@${f}" ); then
-              echo "ERROR: upload failed: $bn"
+                -F "release_id=${RELEASE_ID}" \
+                -F "file=@${f};filename=${bn};type=application/octet-stream" ); then
+              echo "ERROR: upload failed: $bn (http=$http_code)"
               echo "----- response body -----"
               cat "$tmp_body" || true
               echo "-------------------------"
               rm -f "$tmp_body"
-              # 避免立即重试导致限流更严重，略微节流
               sleep 2
               continue
             fi
 
-            # 解析 url（兼容 dict/list + 多字段名）
             url=$(python3 - "$tmp_body" <<'PY'
           import json,sys
           p=sys.argv[1]
@@ -162,7 +165,6 @@ jobs:
 
             if [ -z "$url" ]; then
               echo "ERROR: upload response has no download url: $bn (http=$http_code)"
-              # 打印一份 GET attach_files 也能帮助定位
               sleep 2
               continue
             fi
@@ -175,7 +177,6 @@ jobs:
           json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
 
-            # 节流：降低 429 概率
             sleep 2
           done
 
@@ -192,7 +193,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 拉取 release 附件列表，生成最终映射（即使 upload 响应字段变化也不怕）
           curl -sS --fail-with-body \
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}&page=1&per_page=200" > gitee_attach_files.json
 
@@ -202,7 +202,7 @@ jobs:
           m={}
           if isinstance(arr, list):
               for it in arr:
-                  if not isinstance(it, dict): 
+                  if not isinstance(it, dict):
                       continue
                   name=it.get("name") or it.get("filename") or ""
                   url=it.get("browser_download_url") or it.get("download_url") or it.get("url") or ""
@@ -233,9 +233,8 @@ jobs:
             "prerelease": bool(d.get("prerelease")) \
           }, ensure_ascii=False))'
 
-          # 替换 GitHub release download 链接 -> Gitee 附件链接
-          python3 -c 'import json,re; meta=json.load(open("meta.json","r",encoding="utf-8")); \
-          m=json.load(open("assets_map.json","r",encoding="utf-8")) if __import__("os").path.exists("assets_map.json") else {}; \
+          python3 -c 'import json,re,os; meta=json.load(open("meta.json","r",encoding="utf-8")); \
+          m=json.load(open("assets_map.json","r",encoding="utf-8")) if os.path.exists("assets_map.json") else {}; \
           body=meta["body"]; \
           pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)"); \
           new_body=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body); \
