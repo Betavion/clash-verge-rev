@@ -108,7 +108,7 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload assets to Gitee release (5% progress)
+      - name: Upload assets to Gitee release (5% progress, low-noise)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -119,11 +119,11 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          # pv 用于进度（不在则静默安装，避免刷屏）
+          # Ensure pv exists, install quietly (avoid dpkg progress spam)
           if ! command -v pv >/dev/null 2>&1; then
             echo "Installing pv..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq pv
+            sudo apt-get update -qq >/dev/null 2>&1
+            sudo apt-get install -y -qq -o Dpkg::Use-Pty=0 -o Dpkg::Progress-Fancy=0 pv >/dev/null 2>&1
           fi
 
           echo "{}" > assets_map.json
@@ -138,14 +138,18 @@ jobs:
               tmp_body="$(mktemp)"
               echo "  attempt ${attempt}/5"
 
-              # pv -n 把“百分比”输出到 stderr；awk 只在每 5% 打一次
+              # pv: force progress in CI, refresh interval, % output to stderr
+              # awk: only print every 5%, and flush immediately to avoid buffering
               if http_code=$(
-                pv -n "$f" 2> >(
+                pv -f -n -i 0.2 "$f" 2> >(
                   awk -v fn="$bn" '
+                    BEGIN{last=-1}
                     {
                       p=int($1+0.5);
+                      if (p<0) p=0; if (p>100) p=100;
                       if (p%5==0 && p!=last) {
                         printf("  %s %d%%\n", fn, p) > "/dev/stderr";
+                        fflush("/dev/stderr");
                         last=p;
                       }
                     }
@@ -205,7 +209,7 @@ jobs:
               echo "WARN: giving up on $bn after 5 attempts"
             fi
 
-            # 文件间节流，减少 429
+            # throttle between files to reduce rate-limit risk
             sleep 1
           done
 
