@@ -108,7 +108,7 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload assets to Gitee release (robust)
+      - name: Upload assets to Gitee release (5% progress)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -119,6 +119,13 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
+          # pv 用于进度（不在则静默安装，避免刷屏）
+          if ! command -v pv >/dev/null 2>&1; then
+            echo "Installing pv..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq pv
+          fi
+
           echo "{}" > assets_map.json
 
           for f in assets/*; do
@@ -126,29 +133,32 @@ jobs:
             sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
             echo "Uploading $bn (size=${sz} bytes)"
 
-            tmp_body="$(mktemp)"
+            success=0
+            for attempt in 1 2 3 4 5; do
+              tmp_body="$(mktemp)"
+              echo "  attempt ${attempt}/5"
 
-            # 关键修复点：
-            # 1) multipart 里带 release_id（很多示例都这么做，即便 URL 里已有）:contentReference[oaicite:2]{index=2}
-            # 2) 强制 MIME 为 application/octet-stream，避免 rpm/exe 自动 MIME 触发服务端校验
-            if ! http_code=$(curl -sS --fail-with-body \
-                --connect-timeout 20 \
-                --retry 6 --retry-delay 5 --retry-all-errors \
-                -o "$tmp_body" -w "%{http_code}" \
-                -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                -F "access_token=${GITEE_TOKEN}" \
-                -F "release_id=${RELEASE_ID}" \
-                -F "file=@${f};filename=${bn};type=application/octet-stream" ); then
-              echo "ERROR: upload failed: $bn (http=$http_code)"
-              echo "----- response body -----"
-              cat "$tmp_body" || true
-              echo "-------------------------"
-              rm -f "$tmp_body"
-              sleep 2
-              continue
-            fi
-
-            url=$(python3 - "$tmp_body" <<'PY'
+              # pv -n 把“百分比”输出到 stderr；awk 只在每 5% 打一次
+              if http_code=$(
+                pv -n "$f" 2> >(
+                  awk -v fn="$bn" '
+                    {
+                      p=int($1+0.5);
+                      if (p%5==0 && p!=last) {
+                        printf("  %s %d%%\n", fn, p) > "/dev/stderr";
+                        last=p;
+                      }
+                    }
+                  '
+                ) | curl -sS --fail-with-body \
+                    --connect-timeout 20 \
+                    -o "$tmp_body" -w "%{http_code}" \
+                    -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                    -F "access_token=${GITEE_TOKEN}" \
+                    -F "release_id=${RELEASE_ID}" \
+                    -F "file=@-;filename=${bn};type=application/octet-stream"
+              ); then
+                url=$(python3 - "$tmp_body" <<'PY'
           import json,sys
           p=sys.argv[1]
           d=json.load(open(p,"r",encoding="utf-8"))
@@ -160,24 +170,43 @@ jobs:
               return ""
           print(pick(d))
           PY
-            )
-            rm -f "$tmp_body"
+                )
+                rm -f "$tmp_body"
 
-            if [ -z "$url" ]; then
-              echo "ERROR: upload response has no download url: $bn (http=$http_code)"
-              sleep 2
-              continue
-            fi
-
-            python3 - "$bn" "$url" <<'PY'
+                if [ -z "$url" ]; then
+                  echo "ERROR: upload succeeded but no url returned: $bn (http=$http_code)"
+                  success=0
+                else
+                  python3 - "$bn" "$url" <<'PY'
           import json,sys
           fn,url=sys.argv[1],sys.argv[2]
           m=json.load(open("assets_map.json","r",encoding="utf-8"))
           m[fn]=url
           json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
+                  echo "  OK: $bn"
+                  success=1
+                fi
 
-            sleep 2
+                if [ "$success" -eq 1 ]; then
+                  break
+                fi
+              else
+                echo "ERROR: upload failed: $bn (http=$http_code)"
+                echo "----- response body -----"
+                cat "$tmp_body" || true
+                echo "-------------------------"
+                rm -f "$tmp_body"
+                sleep 3
+              fi
+            done
+
+            if [ "$success" -ne 1 ]; then
+              echo "WARN: giving up on $bn after 5 attempts"
+            fi
+
+            # 文件间节流，减少 429
+            sleep 1
           done
 
           echo "assets_map.json (from upload responses):"
