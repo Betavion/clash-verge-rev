@@ -12,7 +12,7 @@ jobs:
       - name: Fetch upstream latest release
         id: upstream
         run: |
-          set -e
+          set -euo pipefail
           UPSTREAM="clash-verge-rev/clash-verge-rev"
           curl -sS "https://api.github.com/repos/${UPSTREAM}/releases/latest" > latest.json
 
@@ -25,7 +25,7 @@ jobs:
           if [ -z "$tag" ]; then
             echo "No latest release found"; cat latest.json; exit 1
           fi
-          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Check if Gitee already has this tag release
         id: check
@@ -35,7 +35,7 @@ jobs:
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
           TAG:         ${{ steps.upstream.outputs.tag }}
         run: |
-          set -e
+          set -euo pipefail
           curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=1&per_page=100" > gitee_releases.json
 
           exists=$(python3 - "$TAG" <<'PY'
@@ -45,7 +45,7 @@ jobs:
           print("1" if any(r.get("tag_name")==tag for r in arr) else "0")
           PY
           )
-          echo "exists=$exists" >> $GITHUB_OUTPUT
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
 
       - name: Done (already synced)
         if: ${{ steps.check.outputs.exists == '1' }}
@@ -59,21 +59,18 @@ jobs:
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
         run: |
-          set -e
+          set -euo pipefail
 
-          # 取上游 latest release 信息
           tag=$(python3 -c "import json;print(json.load(open('latest.json'))['tag_name'])")
           name=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('name') or d['tag_name'])")
           body=$(python3 -c "import json;d=json.load(open('latest.json'));print(d.get('body') or '')")
           prerelease=$(python3 -c "import json;d=json.load(open('latest.json'));print('true' if d.get('prerelease') else 'false')")
 
-          # 读取 Gitee 仓库默认分支（避免 main/master 不一致）
           curl -sS "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}?access_token=${GITEE_TOKEN}" > repo.json
           default_branch=$(python3 -c "import json;print(json.load(open('repo.json')).get('default_branch','master'))")
           echo "Gitee default_branch=${default_branch}"
 
-          # 创建 release（关键：传 target_commitish）
-          resp=$(curl -sS -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
+          resp=$(curl -sS --fail-with-body -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases" \
             -F "access_token=${GITEE_TOKEN}" \
             -F "tag_name=${tag}" \
             -F "target_commitish=${default_branch}" \
@@ -93,12 +90,12 @@ jobs:
             cat gitee_created.json
             exit 1
           fi
-          echo "release_id=$rid" >> $GITHUB_OUTPUT
+          echo "release_id=$rid" >> "$GITHUB_OUTPUT"
 
       - name: Download upstream assets
         if: ${{ steps.check.outputs.exists != '1' }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p assets
           python3 - <<'PY'
           import json, urllib.request, pathlib
@@ -111,7 +108,7 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload assets to Gitee release
+      - name: Upload assets to Gitee release (robust)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -119,7 +116,7 @@ jobs:
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
           RELEASE_ID:  ${{ steps.create.outputs.release_id }}
         run: |
-          set -e
+          set -euo pipefail
           shopt -s nullglob
 
           echo "{}" > assets_map.json
@@ -128,29 +125,94 @@ jobs:
             bn=$(basename "$f")
             echo "Uploading $bn"
 
-            resp=$(curl \
-              --progress-bar \
-              --connect-timeout 20 \
-              --retry 3 \
-              --retry-delay 5 \
-              --retry-all-errors \
-              -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-              -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${f}" )
-
-            # 提取 Gitee 下载链接
-            url=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("browser_download_url",""))' <<< "$resp")
-
-            if [ -z "$url" ]; then
-              echo "WARN: upload failed(no url): $bn"
+            tmp_body="$(mktemp)"
+            # 关键：fail-with-body + 捕获 http_code，使 4xx/5xx 可见，并能触发 retry
+            if ! http_code=$(curl -sS --fail-with-body \
+                --connect-timeout 20 \
+                --retry 6 --retry-delay 5 --retry-all-errors \
+                -o "$tmp_body" -w "%{http_code}" \
+                -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${f}" ); then
+              echo "ERROR: upload failed: $bn"
+              echo "----- response body -----"
+              cat "$tmp_body" || true
+              echo "-------------------------"
+              rm -f "$tmp_body"
+              # 避免立即重试导致限流更严重，略微节流
+              sleep 2
               continue
             fi
 
-            # 写入映射：{ "filename": "gitee_url", ... }
-            python3 -c 'import json,sys; fn=sys.argv[1]; url=sys.argv[2]; m=json.load(open("assets_map.json","r",encoding="utf-8")); m[fn]=url; json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)' "$bn" "$url"
+            # 解析 url（兼容 dict/list + 多字段名）
+            url=$(python3 - "$tmp_body" <<'PY'
+          import json,sys
+          p=sys.argv[1]
+          d=json.load(open(p,"r",encoding="utf-8"))
+          def pick(x):
+              if isinstance(x, dict):
+                  return x.get("browser_download_url") or x.get("download_url") or x.get("url") or ""
+              if isinstance(x, list) and x:
+                  return pick(x[0])
+              return ""
+          print(pick(d))
+          PY
+            )
+            rm -f "$tmp_body"
+
+            if [ -z "$url" ]; then
+              echo "ERROR: upload response has no download url: $bn (http=$http_code)"
+              # 打印一份 GET attach_files 也能帮助定位
+              sleep 2
+              continue
+            fi
+
+            python3 - "$bn" "$url" <<'PY'
+          import json,sys
+          fn,url=sys.argv[1],sys.argv[2]
+          m=json.load(open("assets_map.json","r",encoding="utf-8"))
+          m[fn]=url
+          json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+
+            # 节流：降低 429 概率
+            sleep 2
           done
 
-          echo "assets_map.json:"
+          echo "assets_map.json (from upload responses):"
+          cat assets_map.json
+
+      - name: Refresh assets_map.json by listing Gitee attachments (most reliable)
+        if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.create.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          # 拉取 release 附件列表，生成最终映射（即使 upload 响应字段变化也不怕）
+          curl -sS --fail-with-body \
+            "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files?access_token=${GITEE_TOKEN}&page=1&per_page=200" > gitee_attach_files.json
+
+          python3 - <<'PY'
+          import json
+          arr=json.load(open("gitee_attach_files.json","r",encoding="utf-8"))
+          m={}
+          if isinstance(arr, list):
+              for it in arr:
+                  if not isinstance(it, dict): 
+                      continue
+                  name=it.get("name") or it.get("filename") or ""
+                  url=it.get("browser_download_url") or it.get("download_url") or it.get("url") or ""
+                  if name and url:
+                      m[name]=url
+          json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+          print("attachments:", len(m))
+          PY
+
+          echo "assets_map.json (from attach_files list):"
           cat assets_map.json
 
       - name: Rewrite release body links to Gitee and update
@@ -161,9 +223,8 @@ jobs:
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
           RELEASE_ID:  ${{ steps.create.outputs.release_id }}
         run: |
-          set -e
+          set -euo pipefail
 
-          # 从 GitHub release API 的 latest.json 里取 tag/name/body/prerelease
           python3 -c 'import json; d=json.load(open("latest.json","r",encoding="utf-8")); \
           open("meta.json","w",encoding="utf-8").write(json.dumps({ \
             "tag_name": d["tag_name"], \
@@ -172,9 +233,10 @@ jobs:
             "prerelease": bool(d.get("prerelease")) \
           }, ensure_ascii=False))'
 
-          # 用 assets_map.json 替换 body 里的 GitHub 下载链接 -> Gitee
+          # 替换 GitHub release download 链接 -> Gitee 附件链接
           python3 -c 'import json,re; meta=json.load(open("meta.json","r",encoding="utf-8")); \
-          m=json.load(open("assets_map.json","r",encoding="utf-8")); body=meta["body"]; \
+          m=json.load(open("assets_map.json","r",encoding="utf-8")) if __import__("os").path.exists("assets_map.json") else {}; \
+          body=meta["body"]; \
           pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)"); \
           new_body=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body); \
           meta["body"]=new_body; \
@@ -182,7 +244,6 @@ jobs:
           print("Matched:", len(pat.findall(body))); \
           print("Replaced:", sum(1 for fn in pat.findall(body) if fn in m))'
 
-          # 生成 Gitee PATCH JSON：必须带 tag_name 和 name
           python3 -c 'import json; meta=json.load(open("meta_rewritten.json","r",encoding="utf-8")); \
           patch={ \
             "access_token":"'"${GITEE_TOKEN}"'", \
@@ -194,11 +255,10 @@ jobs:
           open("patch.json","w",encoding="utf-8").write(json.dumps(patch, ensure_ascii=False))'
 
           echo "PATCH release body to Gitee..."
-          resp=$(curl -sS -X PATCH \
+          resp=$(curl -sS --fail-with-body -X PATCH \
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}" \
             -H "Content-Type: application/json" \
             --data-binary @patch.json)
 
           echo "PATCH response:"
           echo "$resp"
-
