@@ -92,23 +92,203 @@ jobs:
           fi
           echo "release_id=$rid" >> "$GITHUB_OUTPUT"
 
-      - name: Download upstream assets
+      - name: Download upstream assets (only .deb and .exe)
         if: ${{ steps.check.outputs.exists != '1' }}
         run: |
           set -euo pipefail
           mkdir -p assets
           python3 - <<'PY'
-          import json, urllib.request, pathlib
+          import json, urllib.request, pathlib, sys
           d=json.load(open("latest.json","r",encoding="utf-8"))
+          exts=(".deb",".exe")
+          kept=0
           for a in d.get("assets", []):
+              name=a.get("name","")
+              if not name.lower().endswith(exts):
+                  continue
               url=a["browser_download_url"]
-              name=a["name"]
               out=pathlib.Path("assets")/name
               print("Downloading", name)
               urllib.request.urlretrieve(url, out)
+              kept += 1
+          print("Kept assets:", kept)
           PY
 
-      - name: Upload assets to Gitee release (real upload progress every 5%, print body on 400, no retry on 400)
+      - name: Cleanup old Gitee releases to free quota (delete whole releases)
+        if: ${{ steps.check.outputs.exists != '1' }}
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+        run: |
+          set -euo pipefail
+
+          # Gitee 附件配额 1GB：留 200MB 余量（避免临界失败）
+          LIMIT=$((1024*1024*1024))
+          MARGIN=$((200*1024*1024))
+
+          need=$(python3 - <<'PY'
+          import os, glob
+          s=0
+          for p in glob.glob("assets/*"):
+              if os.path.isfile(p):
+                  s += os.path.getsize(p)
+          print(s)
+          PY
+          )
+          echo "Need to upload bytes (filtered .deb/.exe): $need"
+
+          # 拉取所有 releases（翻页）
+          page=1
+          all="[]"
+          while true; do
+            curl -sS --fail-with-body \
+              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=${page}&per_page=100" > rel_page.json
+            n=$(python3 - <<'PY'
+          import json
+          arr=json.load(open("rel_page.json","r",encoding="utf-8"))
+          print(len(arr) if isinstance(arr,list) else 0)
+          PY
+            )
+            if [ "$n" -eq 0 ]; then
+              break
+            fi
+            all=$(python3 - "$all" <<'PY'
+          import json,sys
+          all_=json.loads(sys.argv[1])
+          arr=json.load(open("rel_page.json","r",encoding="utf-8"))
+          if isinstance(arr,list): all_.extend(arr)
+          print(json.dumps(all_, ensure_ascii=False))
+          PY
+            )
+            page=$((page+1))
+          done
+          echo "$all" > all_releases.json
+
+          python3 - <<'PY'
+          import json, datetime
+          arr=json.load(open("all_releases.json","r",encoding="utf-8"))
+          def parse_dt(s):
+              try:
+                  return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+              except Exception:
+                  return datetime.datetime.min
+          arr=[r for r in arr if isinstance(r,dict)]
+          arr.sort(key=lambda r: parse_dt(r.get("created_at","")))
+          json.dump(arr, open("sorted_releases.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+          print("Releases:", len(arr))
+          PY
+
+          used=$(python3 - <<'PY'
+          import json
+          arr=json.load(open("sorted_releases.json","r",encoding="utf-8"))
+          s=0
+          for r in arr:
+              for a in (r.get("assets") or []):
+                  if isinstance(a,dict):
+                      s += int(a.get("size") or 0)
+          print(s)
+          PY
+          )
+          echo "Current assets used bytes (reported by releases.assets): $used"
+
+          target=$((LIMIT - MARGIN - need))
+          echo "Target used <= $target (LIMIT-MARGIN-need)"
+          if [ "$used" -le "$target" ]; then
+            echo "Quota looks OK, no cleanup needed."
+            exit 0
+          fi
+
+          echo "Quota insufficient, start deleting oldest releases..."
+
+          # 从最旧开始删 release（整条删除，包含附件）
+          while true; do
+            used=$(python3 - <<'PY'
+          import json
+          arr=json.load(open("sorted_releases.json","r",encoding="utf-8"))
+          s=0
+          for r in arr:
+              for a in (r.get("assets") or []):
+                  if isinstance(a,dict):
+                      s += int(a.get("size") or 0)
+          print(s)
+          PY
+            )
+            if [ "$used" -le "$target" ]; then
+              echo "Cleanup done. used=$used <= target=$target"
+              break
+            fi
+
+            rid=$(python3 - <<'PY'
+          import json
+          arr=json.load(open("sorted_releases.json","r",encoding="utf-8"))
+          # 找最旧且有附件的 release
+          for r in arr:
+              if (r.get("assets") or []):
+                  print(r.get("id",""))
+                  break
+          PY
+            )
+            if [ -z "$rid" ]; then
+              echo "No more releases with assets to delete, but still over quota."
+              break
+            fi
+
+            echo "Deleting release id=$rid ..."
+            set +e
+            code=$(curl -sS -o del_release_body.json -w "%{http_code}" -X DELETE \
+              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${rid}?access_token=${GITEE_TOKEN}")
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ] || { [ "$code" != "200" ] && [ "$code" != "204" ]; }; then
+              echo "Delete release failed (http=$code). Body:"
+              cat del_release_body.json || true
+              echo "Stop cleanup."
+              break
+            fi
+            echo "Deleted release id=$rid (http=$code)"
+
+            # 重新拉 releases 刷新统计
+            page=1
+            all="[]"
+            while true; do
+              curl -sS --fail-with-body \
+                "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&page=${page}&per_page=100" > rel_page.json
+              n=$(python3 - <<'PY'
+          import json
+          arr=json.load(open("rel_page.json","r",encoding="utf-8"))
+          print(len(arr) if isinstance(arr,list) else 0)
+          PY
+              )
+              if [ "$n" -eq 0 ]; then
+                break
+              fi
+              all=$(python3 - "$all" <<'PY'
+          import json,sys
+          all_=json.loads(sys.argv[1])
+          arr=json.load(open("rel_page.json","r",encoding="utf-8"))
+          if isinstance(arr,list): all_.extend(arr)
+          print(json.dumps(all_, ensure_ascii=False))
+          PY
+              )
+              page=$((page+1))
+            done
+            echo "$all" > all_releases.json
+            python3 - <<'PY'
+          import json, datetime
+          arr=json.load(open("all_releases.json","r",encoding="utf-8"))
+          def parse_dt(s):
+              try:
+                  return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+              except Exception:
+                  return datetime.datetime.min
+          arr=[r for r in arr if isinstance(r,dict)]
+          arr.sort(key=lambda r: parse_dt(r.get("created_at","")))
+          json.dump(arr, open("sorted_releases.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+          done
+
+      - name: Upload assets to Gitee release (only .deb/.exe, progress every 5%, print body on 400, no retry on 400)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -124,6 +304,13 @@ jobs:
 
           for f in assets/*; do
             bn=$(basename "$f")
+            # 双保险：只上传 deb/exe
+            lower="${bn,,}"
+            if [[ "$lower" != *.deb && "$lower" != *.exe ]]; then
+              echo "Skip (not .deb/.exe): $bn"
+              continue
+            fi
+
             sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
             echo "Uploading $bn (size=${sz} bytes)"
 
@@ -133,11 +320,6 @@ jobs:
               tmp_hdr="$(mktemp)"
               echo "  attempt ${attempt}/5"
 
-              # 关键点：
-              # - 使用 curl 自己的 progress meter（是真实网络上传进度）
-              # - progress meter 用 \r 刷新，同一行不换行；用 awk 的 RS='\r' 把每次刷新当成一条记录
-              # - 每 5% 打一行，并 fflush 立即输出
-              # - 禁用 Expect: 100-continue + 强制 http/1.1，减少“0% 直接 400”的情况
               set +e
               http_code=$(
                 curl --fail-with-body --http1.1 -H "Expect:" \
@@ -154,11 +336,8 @@ jobs:
                       {
                         gsub(/\n/,"",$0);
                         sub(/^[[:space:]]+/,"",$0);
-
-                        # 跳过标题行
                         if ($0 ~ /^% Total/) next;
 
-                        # 典型 progress 行：第一列是整数百分比
                         split($0,a,/[[:space:]]+/);
                         if (a[1] ~ /^[0-9]+$/) {
                           p=a[1]+0;
@@ -170,11 +349,7 @@ jobs:
                           next;
                         }
 
-                        # 透传关键错误信息（少量）
-                        if ($0 ~ /^curl: \(/ || $0 ~ /^Warning:/) {
-                          print;
-                          fflush();
-                        }
+                        if ($0 ~ /^curl: \(/ || $0 ~ /^Warning:/) { print; fflush(); }
                       }
                     ' >&2
                   )
@@ -200,7 +375,7 @@ jobs:
                   continue
                 fi
 
-                # 400/401/403/404/422 等：一般重试无意义（但已打印 body 便于你后续定位修复）
+                # 400/401/403/404/422 等：不重试（但已打印 body）
                 break
               fi
 
@@ -243,7 +418,6 @@ jobs:
               echo "$bn" >> failed_uploads.txt
             fi
 
-            # 文件间节流，减少限流触发
             sleep 1
           done
 
