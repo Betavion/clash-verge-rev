@@ -92,26 +92,36 @@ jobs:
           fi
           echo "release_id=$rid" >> "$GITHUB_OUTPUT"
 
-      - name: Download upstream assets (only .deb and .exe)
+      - name: Download upstream assets (only .deb/.exe <= 100MB)
         if: ${{ steps.check.outputs.exists != '1' }}
         run: |
           set -euo pipefail
           mkdir -p assets
           python3 - <<'PY'
-          import json, urllib.request, pathlib, sys
+          import json, urllib.request, pathlib
           d=json.load(open("latest.json","r",encoding="utf-8"))
           exts=(".deb",".exe")
+          max_size=100*1024*1024
           kept=0
+          skipped=[]
           for a in d.get("assets", []):
               name=a.get("name","")
+              size=int(a.get("size") or 0)
               if not name.lower().endswith(exts):
+                  continue
+              if size > max_size:
+                  skipped.append((name,size))
                   continue
               url=a["browser_download_url"]
               out=pathlib.Path("assets")/name
-              print("Downloading", name)
+              print("Downloading", name, f"(size={size})")
               urllib.request.urlretrieve(url, out)
               kept += 1
           print("Kept assets:", kept)
+          if skipped:
+              print("Skipped (too large >100MB):")
+              for n,s in skipped:
+                  print(" -", n, s)
           PY
 
       - name: Cleanup old Gitee releases to free quota (delete whole releases)
@@ -123,7 +133,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Gitee 附件配额 1GB：留 200MB 余量（避免临界失败）
           LIMIT=$((1024*1024*1024))
           MARGIN=$((200*1024*1024))
 
@@ -136,9 +145,8 @@ jobs:
           print(s)
           PY
           )
-          echo "Need to upload bytes (filtered .deb/.exe): $need"
+          echo "Need to upload bytes (filtered): $need"
 
-          # 拉取所有 releases（翻页）
           page=1
           all="[]"
           while true; do
@@ -200,8 +208,6 @@ jobs:
           fi
 
           echo "Quota insufficient, start deleting oldest releases..."
-
-          # 从最旧开始删 release（整条删除，包含附件）
           while true; do
             used=$(python3 - <<'PY'
           import json
@@ -222,7 +228,6 @@ jobs:
             rid=$(python3 - <<'PY'
           import json
           arr=json.load(open("sorted_releases.json","r",encoding="utf-8"))
-          # 找最旧且有附件的 release
           for r in arr:
               if (r.get("assets") or []):
                   print(r.get("id",""))
@@ -248,7 +253,6 @@ jobs:
             fi
             echo "Deleted release id=$rid (http=$code)"
 
-            # 重新拉 releases 刷新统计
             page=1
             all="[]"
             while true; do
@@ -288,7 +292,7 @@ jobs:
           PY
           done
 
-      - name: Upload assets to Gitee release (only .deb/.exe, progress every 5%, print body on 400, no retry on 400)
+      - name: Upload assets to Gitee release (only .deb/.exe <= 100MB, progress every 5%, print body on 400, no retry on 400)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -302,9 +306,10 @@ jobs:
           echo "{}" > assets_map.json
           : > failed_uploads.txt
 
+          MAX=$((100*1024*1024))
+
           for f in assets/*; do
             bn=$(basename "$f")
-            # 双保险：只上传 deb/exe
             lower="${bn,,}"
             if [[ "$lower" != *.deb && "$lower" != *.exe ]]; then
               echo "Skip (not .deb/.exe): $bn"
@@ -312,6 +317,11 @@ jobs:
             fi
 
             sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            if [ "$sz" -gt "$MAX" ]; then
+              echo "Skip (too large >100MB): $bn (size=$sz)"
+              continue
+            fi
+
             echo "Uploading $bn (size=${sz} bytes)"
 
             success=0
@@ -367,15 +377,12 @@ jobs:
 
                 rm -f "$tmp_body" "$tmp_hdr"
 
-                # 只对可能瞬时恢复的情况重试：429 / 5xx / 000(网络)
                 if [ "${http_code:-000}" = "429" ] || [ "${http_code:-000}" = "000" ] || \
                    [ "${http_code:-000}" = "500" ] || [ "${http_code:-000}" = "502" ] || \
                    [ "${http_code:-000}" = "503" ] || [ "${http_code:-000}" = "504" ]; then
                   sleep 5
                   continue
                 fi
-
-                # 400/401/403/404/422 等：不重试（但已打印 body）
                 break
               fi
 
