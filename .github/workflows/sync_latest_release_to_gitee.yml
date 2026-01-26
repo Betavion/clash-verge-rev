@@ -108,7 +108,7 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload assets to Gitee release (5% progress, low-noise)
+      - name: Upload assets to Gitee release (curl progress every 5%)
         if: ${{ steps.check.outputs.exists != '1' && hashFiles('assets/*') != '' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -118,13 +118,6 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-
-          # Ensure pv exists, install quietly (avoid dpkg progress spam)
-          if ! command -v pv >/dev/null 2>&1; then
-            echo "Installing pv..."
-            sudo apt-get update -qq >/dev/null 2>&1
-            sudo apt-get install -y -qq -o Dpkg::Use-Pty=0 -o Dpkg::Progress-Fancy=0 pv >/dev/null 2>&1
-          fi
 
           echo "{}" > assets_map.json
 
@@ -138,31 +131,57 @@ jobs:
               tmp_body="$(mktemp)"
               echo "  attempt ${attempt}/5"
 
-              # pv: force progress in CI, refresh interval, % output to stderr
-              # awk: only print every 5%, and flush immediately to avoid buffering
-              if http_code=$(
-                pv -f -n -i 0.2 "$f" 2> >(
-                  awk -v fn="$bn" '
-                    BEGIN{last=-1}
-                    {
-                      p=int($1+0.5);
-                      if (p<0) p=0; if (p>100) p=100;
-                      if (p%5==0 && p!=last) {
-                        printf("  %s %d%%\n", fn, p) > "/dev/stderr";
+              # 用 curl 自己的进度（真实网络上传），awk 每 5% 打一行，并 fflush 立刻输出
+              set +e
+              http_code=$(
+                curl --fail-with-body \
+                  --connect-timeout 20 \
+                  --retry 6 --retry-delay 5 --retry-all-errors \
+                  -o "$tmp_body" -w "%{http_code}" \
+                  -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+                  -F "access_token=${GITEE_TOKEN}" \
+                  -F "release_id=${RELEASE_ID}" \
+                  -F "file=@${f};filename=${bn};type=application/octet-stream" \
+                  2> >(
+                    awk -v fn="$bn" '
+                      BEGIN{last=-1}
+                      {
+                        gsub(/\r/,"");
+                        # 跳过 header
+                        if ($0 ~ /% Total/) next;
+
+                        # 进度行：第一列是 %Total（整数）
+                        if ($1 ~ /^[0-9]+$/) {
+                          p=$1+0;
+                          if (p%5==0 && p!=last) {
+                            printf("  %s %d%%\n", fn, p) > "/dev/stderr";
+                            fflush("/dev/stderr");
+                            last=p;
+                          }
+                          next;
+                        }
+
+                        # 非进度信息（少量）原样透传
+                        print > "/dev/stderr";
                         fflush("/dev/stderr");
-                        last=p;
                       }
-                    }
-                  '
-                ) | curl -sS --fail-with-body \
-                    --connect-timeout 20 \
-                    -o "$tmp_body" -w "%{http_code}" \
-                    -X POST "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
-                    -F "access_token=${GITEE_TOKEN}" \
-                    -F "release_id=${RELEASE_ID}" \
-                    -F "file=@-;filename=${bn};type=application/octet-stream"
-              ); then
-                url=$(python3 - "$tmp_body" <<'PY'
+                    '
+                  )
+              )
+              rc=$?
+              set -e
+
+              if [ $rc -ne 0 ]; then
+                echo "ERROR: upload failed: $bn (http=${http_code:-unknown})"
+                echo "----- response body -----"
+                cat "$tmp_body" || true
+                echo "-------------------------"
+                rm -f "$tmp_body"
+                sleep 3
+                continue
+              fi
+
+              url=$(python3 - "$tmp_body" <<'PY'
           import json,sys
           p=sys.argv[1]
           d=json.load(open(p,"r",encoding="utf-8"))
@@ -174,42 +193,33 @@ jobs:
               return ""
           print(pick(d))
           PY
-                )
-                rm -f "$tmp_body"
+              )
+              rm -f "$tmp_body"
 
-                if [ -z "$url" ]; then
-                  echo "ERROR: upload succeeded but no url returned: $bn (http=$http_code)"
-                  success=0
-                else
-                  python3 - "$bn" "$url" <<'PY'
+              if [ -z "$url" ]; then
+                echo "ERROR: upload ok but no url returned: $bn (http=$http_code)"
+                sleep 2
+                continue
+              fi
+
+              python3 - "$bn" "$url" <<'PY'
           import json,sys
           fn,url=sys.argv[1],sys.argv[2]
           m=json.load(open("assets_map.json","r",encoding="utf-8"))
           m[fn]=url
           json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
-                  echo "  OK: $bn"
-                  success=1
-                fi
 
-                if [ "$success" -eq 1 ]; then
-                  break
-                fi
-              else
-                echo "ERROR: upload failed: $bn (http=$http_code)"
-                echo "----- response body -----"
-                cat "$tmp_body" || true
-                echo "-------------------------"
-                rm -f "$tmp_body"
-                sleep 3
-              fi
+              echo "  OK: $bn"
+              success=1
+              break
             done
 
             if [ "$success" -ne 1 ]; then
               echo "WARN: giving up on $bn after 5 attempts"
             fi
 
-            # throttle between files to reduce rate-limit risk
+            # 文件间节流，减少触发限流
             sleep 1
           done
 
