@@ -64,7 +64,6 @@ jobs:
               raise SystemExit
           for r in arr:
               if isinstance(r,dict) and r.get("tag_name")==tag:
-                  open("gitee_existing_release.json","w",encoding="utf-8").write(json.dumps(r,ensure_ascii=False))
                   print(str(r.get("id","")))
                   break
           else:
@@ -135,18 +134,25 @@ jobs:
           echo "release_id=$rid" >> "$GITHUB_OUTPUT"
           echo "Created Gitee release id=$rid"
 
-      - name: Export RELEASE_ID
+      - name: Resolve RELEASE_ID (safe with set -u)
         id: rid
         run: |
           set -euo pipefail
+          rid=""
           if [ "${{ steps.find.outputs.exists }}" = "1" ]; then
-            echo "RELEASE_ID=${{ steps.find.outputs.release_id }}" >> "$GITHUB_ENV"
-            echo "release_id=${{ steps.find.outputs.release_id }}" >> "$GITHUB_OUTPUT"
+            rid="${{ steps.find.outputs.release_id }}"
           else
-            echo "RELEASE_ID=${{ steps.create.outputs.release_id }}" >> "$GITHUB_ENV"
-            echo "release_id=${{ steps.create.outputs.release_id }}" >> "$GITHUB_OUTPUT"
+            rid="${{ steps.create.outputs.release_id }}"
           fi
-          echo "Using RELEASE_ID=$RELEASE_ID"
+
+          if [ -z "$rid" ]; then
+            echo "ERROR: RELEASE_ID is empty."
+            exit 1
+          fi
+
+          echo "release_id=$rid" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_ID=$rid" >> "$GITHUB_ENV"
+          echo "Using RELEASE_ID=$rid"
 
       - name: Plan wanted assets and compute missing list (only .deb/.exe <= 100MB)
         id: plan
@@ -154,11 +160,11 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.rid.outputs.release_id }}
         run: |
           set -euo pipefail
           mkdir -p assets
 
-          # 1) 生成 wanted_assets.json（只取 .deb/.exe 且 <=100MB）
           python3 - <<'PY'
           import json
           d=json.load(open("latest.json","r",encoding="utf-8"))
@@ -183,8 +189,6 @@ jobs:
           wanted_count=$(python3 -c "import json;print(len(json.load(open('wanted_assets.json','r',encoding='utf-8'))))")
           echo "wanted_count=$wanted_count" >> "$GITHUB_OUTPUT"
 
-          # 2) 拉取当前 release 的附件列表 -> existing_assets_map.json / assets_map.json
-          #    优先用 attach_files（分页）；失败则 fallback 到 release detail 的 assets 字段
           echo "[]" > gitee_attach_all.json
           ok="1"
           page=1
@@ -264,12 +268,10 @@ jobs:
                   if name and url:
                       m[name]=url
           json.dump(m, open("existing_assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-          # assets_map.json 初始化为“现有附件映射”
           json.dump(m, open("assets_map.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
           print("existing_assets:", len(m))
           PY
 
-          # 3) 计算 missing_assets.json & need_bytes
           python3 - <<'PY'
           import json
           wanted=json.load(open("wanted_assets.json","r",encoding="utf-8"))
@@ -300,20 +302,17 @@ jobs:
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
           NEED_BYTES:  ${{ steps.plan.outputs.need_bytes }}
+          RELEASE_ID:  ${{ steps.rid.outputs.release_id }}
         run: |
           set -euo pipefail
-
-          # 1GB 配额：留 200MB 余量（避免临界失败）
           LIMIT=$((1024*1024*1024))
           MARGIN=$((200*1024*1024))
           need="$NEED_BYTES"
-
           if [ "$need" -le 0 ]; then
             echo "No bytes needed, skip cleanup."
             exit 0
           fi
 
-          # 拉取所有 releases（翻页）
           page=1
           all="[]"
           while true; do
@@ -325,9 +324,7 @@ jobs:
           print(len(arr) if isinstance(arr,list) else 0)
           PY
             )
-            if [ "$n" -eq 0 ]; then
-              break
-            fi
+            if [ "$n" -eq 0 ]; then break; fi
             all=$(python3 - "$all" <<'PY'
           import json,sys
           all_=json.loads(sys.argv[1])
@@ -337,9 +334,7 @@ jobs:
           PY
             )
             page=$((page+1))
-            if [ "$page" -gt 50 ]; then
-              break
-            fi
+            if [ "$page" -gt 50 ]; then break; fi
           done
           echo "$all" > all_releases.json
 
@@ -347,14 +342,11 @@ jobs:
           import json, datetime
           arr=json.load(open("all_releases.json","r",encoding="utf-8"))
           def parse_dt(s):
-              try:
-                  return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
-              except Exception:
-                  return datetime.datetime.min
+              try: return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+              except Exception: return datetime.datetime.min
           arr=[r for r in arr if isinstance(r,dict)]
           arr.sort(key=lambda r: parse_dt(r.get("created_at","")))
           json.dump(arr, open("sorted_releases.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-          print("Releases:", len(arr))
           PY
 
           used=$(python3 - <<'PY'
@@ -368,16 +360,16 @@ jobs:
           print(s)
           PY
           )
-          echo "Current assets used bytes (reported by releases.assets): $used"
+          echo "Current assets used bytes: $used"
 
           target=$((LIMIT - MARGIN - need))
-          echo "Target used <= $target (LIMIT-MARGIN-need)"
+          echo "Target used <= $target"
           if [ "$used" -le "$target" ]; then
             echo "Quota looks OK, no cleanup needed."
             exit 0
           fi
 
-          echo "Quota insufficient, start deleting oldest releases (skip current RELEASE_ID=$RELEASE_ID)..."
+          echo "Quota insufficient, deleting oldest releases (skip current RELEASE_ID=$RELEASE_ID)..."
           while true; do
             used=$(python3 - <<'PY'
           import json
@@ -395,7 +387,7 @@ jobs:
               break
             fi
 
-            rid=$(python3 - <<'PY'
+            rid_del=$(python3 - <<'PY'
           import json, os
           cur=os.environ.get("RELEASE_ID","")
           arr=json.load(open("sorted_releases.json","r",encoding="utf-8"))
@@ -407,15 +399,15 @@ jobs:
                   break
           PY
             )
-            if [ -z "$rid" ]; then
+            if [ -z "$rid_del" ]; then
               echo "No more deletable releases with assets (excluding current), but still over quota."
               break
             fi
 
-            echo "Deleting release id=$rid ..."
+            echo "Deleting release id=$rid_del ..."
             set +e
             code=$(curl -sS -o del_release_body.json -w "%{http_code}" -X DELETE \
-              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${rid}?access_token=${GITEE_TOKEN}")
+              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${rid_del}?access_token=${GITEE_TOKEN}")
             rc=$?
             set -e
             if [ $rc -ne 0 ] || { [ "$code" != "200" ] && [ "$code" != "204" ]; }; then
@@ -424,9 +416,9 @@ jobs:
               echo "Stop cleanup."
               break
             fi
-            echo "Deleted release id=$rid (http=$code)"
+            echo "Deleted release id=$rid_del (http=$code)"
 
-            # 重新拉 releases 刷新统计
+            # refresh sorted list
             page=1
             all="[]"
             while true; do
@@ -438,9 +430,7 @@ jobs:
           print(len(arr) if isinstance(arr,list) else 0)
           PY
               )
-              if [ "$n" -eq 0 ]; then
-                break
-              fi
+              if [ "$n" -eq 0 ]; then break; fi
               all=$(python3 - "$all" <<'PY'
           import json,sys
           all_=json.loads(sys.argv[1])
@@ -450,26 +440,22 @@ jobs:
           PY
               )
               page=$((page+1))
-              if [ "$page" -gt 50 ]; then
-                break
-              fi
+              if [ "$page" -gt 50 ]; then break; fi
             done
             echo "$all" > all_releases.json
             python3 - <<'PY'
           import json, datetime
           arr=json.load(open("all_releases.json","r",encoding="utf-8"))
           def parse_dt(s):
-              try:
-                  return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
-              except Exception:
-                  return datetime.datetime.min
+              try: return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+              except Exception: return datetime.datetime.min
           arr=[r for r in arr if isinstance(r,dict)]
           arr.sort(key=lambda r: parse_dt(r.get("created_at","")))
           json.dump(arr, open("sorted_releases.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
           done
 
-      - name: Download missing upstream assets (only .deb/.exe <= 100MB)
+      - name: Download missing upstream assets
         if: ${{ steps.plan.outputs.missing_count != '0' }}
         run: |
           set -euo pipefail
@@ -485,39 +471,25 @@ jobs:
               urllib.request.urlretrieve(url, out)
           PY
 
-      - name: Upload missing assets to Gitee release (progress every 5%, print body on 4xx/5xx, no retry on 400)
+      - name: Upload missing assets to Gitee release (progress every 5%, no retry on 400, print body)
         if: ${{ steps.plan.outputs.missing_count != '0' }}
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.rid.outputs.release_id }}
         run: |
           set -euo pipefail
           shopt -s nullglob
 
-          # assets_map.json 里已有“现有附件”的映射；这里仅补充“新上传成功”的映射
           if [ ! -f assets_map.json ]; then
             echo "{}" > assets_map.json
           fi
           : > failed_uploads.txt
 
-          MAX=$((100*1024*1024))
-
           for f in assets/*; do
             bn=$(basename "$f")
-            lower="${bn,,}"
-            if [[ "$lower" != *.deb && "$lower" != *.exe ]]; then
-              echo "Skip (not .deb/.exe): $bn"
-              continue
-            fi
-
-            sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
-            if [ "$sz" -gt "$MAX" ]; then
-              echo "Skip (too large >100MB): $bn (size=$sz)"
-              continue
-            fi
-
-            echo "Uploading $bn (size=${sz} bytes)"
+            echo "Uploading $bn"
 
             success=0
             for attempt in 1 2 3 4 5; do
@@ -572,15 +544,12 @@ jobs:
 
                 rm -f "$tmp_body" "$tmp_hdr"
 
-                # 只对可能瞬时恢复的情况重试：429 / 5xx / 000(网络)
                 if [ "${http_code:-000}" = "429" ] || [ "${http_code:-000}" = "000" ] || \
                    [ "${http_code:-000}" = "500" ] || [ "${http_code:-000}" = "502" ] || \
                    [ "${http_code:-000}" = "503" ] || [ "${http_code:-000}" = "504" ]; then
                   sleep 5
                   continue
                 fi
-
-                # 400/401/403/404/422 等：不重试（但已打印 body）
                 break
               fi
 
@@ -639,6 +608,7 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.rid.outputs.release_id }}
         run: |
           set -euo pipefail
 
@@ -711,16 +681,16 @@ jobs:
             cat assets_map.json
           fi
 
-      - name: Check and fix release body links (only replace when file exists in assets_map)
+      - name: Check and fix release body links (replace only when asset exists)
         id: body
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
           GITEE_REPO:  ${{ secrets.GITEE_REPO }}
+          RELEASE_ID:  ${{ steps.rid.outputs.release_id }}
         run: |
           set -euo pipefail
 
-          # upstream meta
           python3 - <<'PY'
           import json
           d=json.load(open("latest.json","r",encoding="utf-8"))
@@ -733,7 +703,6 @@ jobs:
           json.dump(meta, open("meta.json","w",encoding="utf-8"), ensure_ascii=False)
           PY
 
-          # compute desired body: only replace github link -> gitee when filename exists in assets_map.json
           python3 - <<'PY'
           import json,re,os
           meta=json.load(open("meta.json","r",encoding="utf-8"))
@@ -742,32 +711,29 @@ jobs:
               m=json.load(open("assets_map.json","r",encoding="utf-8"))
           body=meta["body"]
           pat=re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/releases/download/[^/\s]+/([^\s\)\]]+)")
-          new_body=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body)
-          meta["body"]=new_body
+          meta["body"]=pat.sub(lambda mm: m.get(mm.group(1), mm.group(0)), body)
           json.dump(meta, open("meta_rewritten.json","w",encoding="utf-8"), ensure_ascii=False)
           print("Matched:", len(pat.findall(body)))
           print("Replaced:", sum(1 for fn in pat.findall(body) if fn in m))
           PY
 
-          # fetch current gitee release detail to compare body
           set +e
           code=$(curl -sS -o gitee_release_detail.json -w "%{http_code}" \
             "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${RELEASE_ID}?access_token=${GITEE_TOKEN}")
           rc=$?
           set -e
-          if [ $rc -ne 0 ] || [ "$code" != "200" ]; then
-            echo "WARN: cannot fetch current release detail for compare (rc=$rc http=$code). Will still try PATCH."
-            echo "----- response body -----"
-            cat gitee_release_detail.json || true
-            echo "-------------------------"
-            current_body=""
-          else
+
+          current_body=""
+          if [ $rc -eq 0 ] && [ "$code" = "200" ]; then
             current_body=$(python3 - <<'PY'
           import json
           d=json.load(open("gitee_release_detail.json","r",encoding="utf-8"))
           print(d.get("body") or "")
           PY
             )
+          else
+            echo "WARN: cannot fetch current release detail for compare (rc=$rc http=$code). Body:"
+            cat gitee_release_detail.json || true
           fi
 
           desired_body=$(python3 - <<'PY'
@@ -777,13 +743,12 @@ jobs:
           PY
           )
 
-          if [ "$current_body" = "$desired_body" ] && [ -n "$current_body" ]; then
+          if [ -n "$current_body" ] && [ "$current_body" = "$desired_body" ]; then
             echo "Release body already up-to-date. No PATCH needed."
             echo "patched=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # PATCH (must include tag_name and name)
           python3 - <<'PY'
           import json, os
           meta=json.load(open("meta_rewritten.json","r",encoding="utf-8"))
